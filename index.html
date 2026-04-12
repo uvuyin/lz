@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js x MediaPipe: 星系坍缩交互特效</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Courier New', Courier, monospace;
+        }
+
+        #webgl-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        /* 科技感 UI 面板 */
+        #ui-panel {
+            position: absolute;
+            top: 30px;
+            left: 30px;
+            z-index: 10;
+            color: #00ffff;
+            background: rgba(0, 20, 40, 0.5);
+            border: 1px solid #00ffff;
+            border-radius: 8px;
+            padding: 20px;
+            backdrop-filter: blur(5px);
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.2);
+            pointer-events: none;
+            user-select: none;
+        }
+
+        #ui-panel h1 {
+            margin: 0 0 10px 0;
+            font-size: 1.2rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            border-bottom: 1px solid rgba(0, 255, 255, 0.5);
+            padding-bottom: 5px;
+        }
+
+        .data-row {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            font-size: 0.9rem;
+        }
+
+        .data-value {
+            font-weight: bold;
+            color: #fff;
+            text-shadow: 0 0 5px #fff;
+        }
+
+        /* 画中画容器 */
+        #pip-container {
+            position: absolute;
+            bottom: 30px;
+            right: 30px;
+            z-index: 10;
+            width: 240px;
+            height: 180px;
+            border: 2px solid #ff00ff;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 0 20px rgba(255, 0, 255, 0.3);
+            background: #000;
+        }
+
+        #pip-canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1); /* 镜像翻转以符合自拍视角 */
+        }
+
+        /* 隐藏的视频元素供 MediaPipe 处理 */
+        #video-feed {
+            display: none;
+        }
+
+        /* 状态提示 */
+        #status-message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            z-index: 20;
+            font-size: 1.2rem;
+            text-align: center;
+            background: rgba(0,0,0,0.7);
+            padding: 20px;
+            border-radius: 10px;
+            pointer-events: none;
+            transition: opacity 0.5s;
+        }
+    </style>
+
+    <!-- 导入 MediaPipe 依赖 (通过独立脚本加载以确保最高兼容性) -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <!-- 导入 Three.js 及相关插件 -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="webgl-container"></div>
+
+    <div id="ui-panel">
+        <h1>Galaxy Telemetry</h1>
+        <div class="data-row">
+            <span>STATUS:</span>
+            <span class="data-value" id="status-val">STABLE</span>
+        </div>
+        <div class="data-row">
+            <span>LUMINOSITY:</span>
+            <span class="data-value" id="lum-val">95.0%</span>
+        </div>
+        <div class="data-row">
+            <span>COLLAPSE:</span>
+            <span class="data-value" id="collapse-val">0.00</span>
+        </div>
+        <div style="margin-top: 15px; font-size: 0.75rem; color: #aaa;">
+            [ Pinch hand to collapse ]<br>
+            [ Move hand to shift ]
+        </div>
+    </div>
+
+    <div id="pip-container">
+        <video id="video-feed" autoplay playsinline></video>
+        <canvas id="pip-canvas" width="640" height="480"></canvas>
+    </div>
+
+    <div id="status-message">初始化引擎与摄像头...<br><span style="font-size: 0.8em; color: #aaa">(请允许摄像头权限以使用手势控制)</span></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+        // --- 全局变量与状态 ---
+        let scene, camera, renderer, composer;
+        let galaxyGroup, particlesMaterial;
+        
+        // 阻尼状态变量
+        let currentCollapse = 0;
+        let targetCollapse = 0;
+        let currentPosX = 0;
+        let currentPosY = 0;
+        let targetPosX = 0;
+        let targetPosY = 0;
+        
+        // UI 元素
+        const lumUI = document.getElementById('lum-val');
+        const collapseUI = document.getElementById('collapse-val');
+        const statusUI = document.getElementById('status-val');
+        const statusMsg = document.getElementById('status-message');
+
+        // --- 1. Three.js 核心初始化 ---
+        function initThree() {
+            const container = document.getElementById('webgl-container');
+
+            // 场景与相机
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.02);
+            
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 15, 25);
+            camera.lookAt(0, 0, 0);
+
+            // 渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            // 包含星系的组（用于整体位移跟随手势）
+            galaxyGroup = new THREE.Group();
+            scene.add(galaxyGroup);
+
+            // 创建自定义粒子纹理 (Radial Gradient)
+            const particleTexture = createParticleTexture();
+
+            // 生成星系
+            generateGalaxy(particleTexture);
+
+            // 后期处理：UnrealBloomPass
+            const renderScene = new RenderPass(scene, camera);
+            // 参数: resolution, strength, radius, threshold
+            const bloomPass = new UnrealBloomPass(
+                new THREE.Vector2(window.innerWidth, window.innerHeight),
+                3.0,   // strength: 大幅提高发光强度 (原 1.5 -> 3.0)
+                0.8,   // radius: 稍微扩大发光半径 (原 0.5 -> 0.8)
+                0.0    // threshold: 阈值设为0，确保所有亮色都发光
+            );
+
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+
+            // 响应窗口调整
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // --- 2. 创建径向渐变粒子贴图 ---
+        function createParticleTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128;
+            canvas.height = 128;
+            const context = canvas.getContext('2d');
+
+            // 绘制中心亮、边缘透明的圆
+            const gradient = context.createRadialGradient(64, 64, 0, 64, 64, 64);
+            gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+            gradient.addColorStop(0.1, 'rgba(255, 255, 255, 1)'); // 扩大实心高光区，让核心更亮
+            gradient.addColorStop(0.4, 'rgba(255, 255, 255, 0.8)'); // 提亮中段过渡
+            gradient.addColorStop(0.8, 'rgba(255, 255, 255, 0.2)');
+            gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+
+            context.fillStyle = gradient;
+            context.fillRect(0, 0, 128, 128);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        // --- 3. 根据数学分布方程生成星系 ---
+        function generateGalaxy(texture) {
+            const particleCount = 40000;
+            const geometry = new THREE.BufferGeometry();
+
+            const positions = new Float32Array(particleCount * 3);
+            const spherePositions = new Float32Array(particleCount * 3); // 新增：保存重组为球体时的目标位置
+            const colors = new Float32Array(particleCount * 3);
+            
+            // 颜色定义
+            const colorCore = new THREE.Color(0xffffff); // 白
+            const colorMid = new THREE.Color(0xff00ff);  // 洋红
+            const colorOuter = new THREE.Color(0x00ffff);// 青
+
+            const maxRadius = 18;
+
+            for (let i = 0; i < particleCount; i++) {
+                const i3 = i * 3;
+
+                // 极坐标分布：r = sqrt(random) * maxRadius 保证中心致密
+                const randomVal = Math.random();
+                const r = Math.sqrt(randomVal) * maxRadius;
+                
+                // 角度随机，额外加入螺旋偏移量 (随着半径增加，发生旋转)
+                const theta = Math.random() * 2 * Math.PI;
+                const spiralAngle = theta + (r * 0.3); // 0.3是旋臂弯曲度
+
+                // 转换为笛卡尔坐标
+                const x = Math.cos(spiralAngle) * r;
+                // 中心厚，边缘薄的扁平圆盘 y分布
+                const ySpread = Math.max(0.1, 2.0 - (r / maxRadius) * 2.0); 
+                const y = (Math.random() - 0.5) * ySpread * (Math.random() > 0.5 ? 1 : -1); 
+                const z = Math.sin(spiralAngle) * r;
+
+                positions[i3] = x;
+                positions[i3 + 1] = y;
+                positions[i3 + 2] = z;
+
+                // 新增：生成球体目标位置 (保证在体积内均匀分布)
+                const sphereRadius = 8.0; // 重组后球体的半径
+                const u = Math.random();
+                const v = Math.random();
+                const theta2 = u * 2.0 * Math.PI;
+                const phi = Math.acos(2.0 * v - 1.0);
+                const rSphere = sphereRadius * Math.pow(Math.random(), 1/3); // 立方根保证内部不拥挤，体积分布均匀
+                
+                spherePositions[i3] = rSphere * Math.sin(phi) * Math.cos(theta2);
+                spherePositions[i3 + 1] = rSphere * Math.sin(phi) * Math.sin(theta2);
+                spherePositions[i3 + 2] = rSphere * Math.cos(phi);
+
+                // 根据半径进行颜色插值 (Lerp)
+                const mixedColor = new THREE.Color();
+                if (r < maxRadius * 0.3) {
+                    mixedColor.lerpColors(colorCore, colorMid, r / (maxRadius * 0.3));
+                } else {
+                    mixedColor.lerpColors(colorMid, colorOuter, (r - maxRadius * 0.3) / (maxRadius * 0.7));
+                }
+
+                colors[i3] = mixedColor.r;
+                colors[i3 + 1] = mixedColor.g;
+                colors[i3 + 2] = mixedColor.b;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('spherePosition', new THREE.BufferAttribute(spherePositions, 3)); // 注入球体目标位置数据
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            // 自定义着色器材质：支持由 GPU 计算坍缩，性能远超 CPU 遍历
+            particlesMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0 },
+                    uTexture: { value: texture },
+                    uCollapse: { value: 0 } // 0=星系, 1=重组为球体
+                },
+                vertexColors: true,
+                vertexShader: `
+                    uniform float uTime;
+                    uniform float uCollapse;
+                    attribute vec3 spherePosition;
+                    varying vec3 vColor;
+                    
+                    void main() {
+                        vColor = color;
+                        vec3 pos = position;
+                        
+                        // 星系形态下的自转 (基于中心距离)
+                        float dist = length(pos.xz);
+                        float angle = uTime * 0.1 + dist * 0.05;
+                        mat2 rot = mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
+                        pos.xz = rot * pos.xz;
+                        
+                        // 球体形态下的自转 (多轴匀速旋转)
+                        vec3 sPos = spherePosition;
+                        float sphereAngle = uTime * 0.5;
+                        mat2 rotSphere = mat2(cos(sphereAngle), -sin(sphereAngle), sin(sphereAngle), cos(sphereAngle));
+                        sPos.xz = rotSphere * sPos.xz;
+                        sPos.xy = rotSphere * sPos.xy; 
+                        
+                        // 重组逻辑：在星系位置和球体位置之间平滑过度
+                        pos = mix(pos, sPos, uCollapse);
+                        
+                        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                        
+                        // 近大远小，重组为球体时缩放系数微调为 0.8 防止粒子显得太小
+                        gl_PointSize = (50.0 / -mvPosition.z) * mix(1.0, 0.8, uCollapse);
+                        gl_Position = projectionMatrix * mvPosition;
+                    }
+                `,
+                fragmentShader: `
+                    uniform sampler2D uTexture;
+                    varying vec3 vColor;
+                    
+                    void main() {
+                        // 使用自定义发光纹理与顶点颜色混合
+                        vec4 texColor = texture2D(uTexture, gl_PointCoord);
+                        // 乘以 2.5 提升整体色彩亮度和泛光效果
+                        gl_FragColor = vec4(vColor * texColor.rgb * 2.5, texColor.a);
+                    }
+                `,
+                transparent: true,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending // 叠加发光混合
+            });
+
+            const particles = new THREE.Points(geometry, particlesMaterial);
+            galaxyGroup.add(particles);
+        }
+
+        // --- 4. 窗口调整事件 ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- 5. MediaPipe 手势识别逻辑 ---
+        const videoElement = document.getElementById('video-feed');
+        const canvasElement = document.getElementById('pip-canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+
+        function initMediaPipe() {
+            const hands = new Hands({
+                locateFile: (file) => {
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+                }
+            });
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.6,
+                minTrackingConfidence: 0.6
+            });
+
+            hands.onResults(onHandResults);
+
+            const cameraUtils = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({ image: videoElement });
+                },
+                width: 640,
+                height: 480
+            });
+
+            cameraUtils.start()
+                .then(() => {
+                    statusMsg.style.opacity = 0;
+                })
+                .catch((err) => {
+                    console.error("Camera access failed:", err);
+                    handleCameraFailure();
+                });
+        }
+
+        // 处理手势结果
+        function onHandResults(results) {
+            // 清空画板并绘制视频流
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // 绘制带骨架的手部
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00ffff', lineWidth: 2});
+                drawLandmarks(canvasCtx, landmarks, {color: '#ff00ff', lineWidth: 1, radius: 2});
+
+                // --- 业务逻辑 1: 捏合检测 ---
+                const thumbTip = landmarks[4];
+                const indexTip = landmarks[8];
+                const distance = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+                
+                // 阈值判定
+                if (distance < 0.06) {
+                    targetCollapse = 1.0;
+                    statusUI.innerText = "COLLAPSING";
+                    statusUI.style.color = "#ff00ff";
+                } else {
+                    targetCollapse = 0.0;
+                    statusUI.innerText = "STABLE";
+                    statusUI.style.color = "#00ffff";
+                }
+
+                // --- 业务逻辑 2: 整体手部跟随 ---
+                // 使用中指根部(9号点)代表手心位置
+                const handCenter = landmarks[9];
+                
+                // 映射坐标系: MediaPipe [0,1] -> Three.js 世界坐标范围
+                // 注意：因为画布翻转了(自拍镜像)，X轴逻辑需适当取反处理
+                targetPosX = (handCenter.x - 0.5) * -20; 
+                targetPosY = -(handCenter.y - 0.5) * 15;
+                
+            } else {
+                // 没有检测到手时，恢复原状
+                targetCollapse = 0.0;
+                targetPosX = 0.0;
+                targetPosY = 0.0;
+                statusUI.innerText = "SEARCHING...";
+                statusUI.style.color = "#aaa";
+            }
+            canvasCtx.restore();
+        }
+
+        // 如果摄像头失败的降级逻辑 (鼠标交互)
+        function handleCameraFailure() {
+            statusMsg.innerHTML = "摄像头未开启<br><span style='font-size:0.8em'>已降级为鼠标模式: 移动鼠标控制方向，按住左键收缩星系</span>";
+            setTimeout(() => statusMsg.style.opacity = 0, 4000);
+            
+            document.getElementById('pip-container').style.display = 'none';
+
+            window.addEventListener('mousemove', (e) => {
+                targetPosX = (e.clientX / window.innerWidth - 0.5) * 20;
+                targetPosY = -(e.clientY / window.innerHeight - 0.5) * 15;
+            });
+
+            window.addEventListener('mousedown', () => { 
+                targetCollapse = 1.0; 
+                statusUI.innerText = "COLLAPSING";
+            });
+            window.addEventListener('mouseup', () => { 
+                targetCollapse = 0.0; 
+                statusUI.innerText = "STABLE";
+            });
+        }
+
+        // --- 6. 动画主循环 ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const elapsedTime = clock.getElapsedTime();
+
+            // 阻尼更新 (Smooth Damp)
+            const dampFactor = 0.05;
+            currentCollapse += (targetCollapse - currentCollapse) * dampFactor;
+            currentPosX += (targetPosX - currentPosX) * dampFactor;
+            currentPosY += (targetPosY - currentPosY) * dampFactor;
+
+            // 更新 Shader Uniform
+            if (particlesMaterial) {
+                particlesMaterial.uniforms.uTime.value = elapsedTime;
+                particlesMaterial.uniforms.uCollapse.value = currentCollapse;
+            }
+
+            // 更新星系整体位置与倾角
+            galaxyGroup.position.x = currentPosX;
+            galaxyGroup.position.y = currentPosY;
+            galaxyGroup.rotation.z = currentPosX * -0.02; // 根据平移微微倾斜，增加惯性动态感
+            galaxyGroup.rotation.x = currentPosY * 0.02;
+
+            // 更新 UI: Luminosity 数值随手势实时波动
+            // 基础亮度 85，坍缩时提升，加入一些噪声波动增加真实感
+            const baseLum = 85.0;
+            const flexLum = currentCollapse * 115.0; // 坍缩时最高可达 200%
+            const noise = (Math.random() * 2 - 1) * (currentCollapse > 0.1 ? 5 : 1);
+            const finalLum = (baseLum + flexLum + noise).toFixed(1);
+            
+            lumUI.innerText = `${finalLum}%`;
+            collapseUI.innerText = currentCollapse.toFixed(3);
+            
+            if(currentCollapse > 0.8) {
+                lumUI.style.color = "#ff00ff";
+            } else {
+                lumUI.style.color = "#fff";
+            }
+
+            // 使用 Composer 渲染 Bloom 效果
+            composer.render();
+        }
+
+        // --- 7. 启动程序 ---
+        initThree();
+        initMediaPipe();
+        animate();
+
+    </script>
+</body>
+</html>
